@@ -11,6 +11,7 @@ const requireFromProject = createRequire(path.join(PROJECT_ROOT, 'package.json')
 const BUILD_DIR = path.join(PROJECT_ROOT, 'build', 'web-mobile');
 const CHANNELS = ['facebook', 'google', 'tiktok', 'mintegral', 'unityads', 'applovin', 'ironsource', 'kwai', 'vungle', 'snap'];
 const BRIDGE_JS = fs.readFileSync(path.join(SCRIPT_DIR, 'bridge.playable-sdk.js'), 'utf8');
+const B91_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!\"#$%&'()*+,-./:;=?@[]^_`{|}~";
 
 // These files are inlined directly into HTML, so do not duplicate them into PACK.
 const INLINE_FILES = new Set([
@@ -42,6 +43,13 @@ function resolveOutputDirFromArgs(args = process.argv.slice(2)) {
     return path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
   }
   return path.join(PROJECT_ROOT, 'dist-playable');
+}
+
+function resolveUseBase64FromArgs(args = process.argv.slice(2)) {
+  const key = '--use-base64';
+  const idx = args.indexOf(key);
+  if (idx < 0) return true;
+  return parseBooleanLike(args[idx + 1], true);
 }
 
 function resolveCompressImagesFromArgs(args = process.argv.slice(2)) {
@@ -102,6 +110,36 @@ function escapeInlineScript(source) {
 
 function escapeInlineStyle(source) {
   return String(source).replace(/<\/style/gi, '<\\/style');
+}
+
+function encodeBase91(buf) {
+  let b = 0;
+  let n = 0;
+  let out = '';
+
+  for (let i = 0; i < buf.length; i++) {
+    b |= (buf[i] & 255) << n;
+    n += 8;
+    if (n > 13) {
+      let v = b & 8191;
+      if (v > 88) {
+        b >>= 13;
+        n -= 13;
+      } else {
+        v = b & 16383;
+        b >>= 14;
+        n -= 14;
+      }
+      out += B91_ALPHABET[v % 91] + B91_ALPHABET[Math.floor(v / 91)];
+    }
+  }
+
+  if (n) {
+    out += B91_ALPHABET[b % 91];
+    if (n > 7 || b > 90) out += B91_ALPHABET[Math.floor(b / 91)];
+  }
+
+  return out;
 }
 
 function guessMime(rel) {
@@ -851,29 +889,31 @@ function sha1(s) {
   return crypto.createHash('sha1').update(s).digest('hex').slice(0, 10);
 }
 
-function inlineHtml(channel, manifest, blob) {
+function inlineHtml(channel, manifest, blob, useBase64) {
   let html = fs.readFileSync(path.join(BUILD_DIR, 'index.html'), 'utf8');
   const manifestJson = JSON.stringify(manifest);
-  const blobB64 = blob.toString('base64');
+  const blobPayload = useBase64 ? blob.toString('base64') : encodeBase91(blob);
   const PACK_CHUNK_SIZE = 256 * 1024;
 
-  const blobB64Chunks = [];
-  for (let i = 0; i < blobB64.length; i += PACK_CHUNK_SIZE) {
-    blobB64Chunks.push(blobB64.slice(i, i + PACK_CHUNK_SIZE));
+  const blobChunks = [];
+  for (let i = 0; i < blobPayload.length; i += PACK_CHUNK_SIZE) {
+    blobChunks.push(blobPayload.slice(i, i + PACK_CHUNK_SIZE));
   }
-  const packedChunkTags = blobB64Chunks
+  const packedChunkTags = blobChunks
     .map((chunk, idx) => `<script class="__PACK_BIN_CHUNK__" data-idx="${idx}" type="application/octet-stream">${chunk}</script>`)
     .join('\n');
   const manifestTag = `<script id="__PACK_MANIFEST__" type="application/octet-stream">${escapeInlineScript(manifestJson)}</script>`;
 
   const packedBootstrap = `<script>(function(){
+  const PACK_ENCODING = ${JSON.stringify(useBase64 ? 'base64' : 'base91')};
+  const B91_ALPHABET = ${JSON.stringify(B91_ALPHABET)};
   const nodes = document.querySelectorAll('script.__PACK_BIN_CHUNK__');
   const manifestNode = document.getElementById('__PACK_MANIFEST__');
-  let b64 = '';
+  let payload = '';
   for (let i = 0; i < nodes.length; i++) {
-    b64 += nodes[i].textContent || '';
+    payload += nodes[i].textContent || '';
   }
-  b64 = b64.replace(/\\s+/g, '');
+  payload = payload.replace(/\\s+/g, '');
   const manifestText = manifestNode ? (manifestNode.textContent || '{}') : '{}';
   const B64_TABLE = new Int16Array(128).fill(-1);
   for (let i = 0; i < 26; i++) {
@@ -921,9 +961,56 @@ function inlineHtml(channel, manifest, blob) {
     }
     return out;
   }
+
+  function b91ToBytes(input){
+    const table = new Int16Array(128).fill(-1);
+    for (let i = 0; i < B91_ALPHABET.length; i++) {
+      const code = B91_ALPHABET.charCodeAt(i);
+      if (code < 128) table[code] = i;
+    }
+
+    let v = -1;
+    let b = 0;
+    let n = 0;
+    const out = [];
+    const clean = String(input || '').replace(/\\s+/g, '');
+
+    for (let i = 0; i < clean.length; i++) {
+      const c = clean.charCodeAt(i);
+      if (c >= 128) continue;
+      const d = table[c];
+      if (d < 0) continue;
+
+      if (v < 0) {
+        v = d;
+      } else {
+        v += d * 91;
+        b |= v << n;
+        n += (v & 8191) > 88 ? 13 : 14;
+        while (n > 7) {
+          out.push(b & 255);
+          b >>= 8;
+          n -= 8;
+        }
+        v = -1;
+      }
+    }
+
+    if (v >= 0) {
+      out.push((b | (v << n)) & 255);
+    }
+
+    return new Uint8Array(out);
+  }
+
+  function decodePayload(raw){
+    if (PACK_ENCODING === 'base91') return b91ToBytes(raw);
+    return b64ToBytes(raw);
+  }
+
   try {
     window.__PACK_MANIFEST__ = JSON.parse(manifestText);
-    window.__PACK_BLOB__ = b64ToBytes(b64);
+    window.__PACK_BLOB__ = decodePayload(payload);
     if (!window.__PACKED_FILES__) window.__PACKED_FILES__ = {};
     for (let i = 0; i < nodes.length; i++) {
       if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
@@ -972,7 +1059,7 @@ ${packedBootstrap}
 
   html = html.replace(
     /<script[^>]*>\s*System\.import\((['"])\.\/index\.js\1\)[\s\S]*?<\/script>/i,
-    injected + '\n$&'
+    (matched) => `${injected}\n${matched}`
   );
 
   html = html.replace(/<title>.*?<\/title>/i, `<title>Playable-${channel}-${sha1(channel + String(Object.keys(manifest).length))}</title>`);
@@ -985,6 +1072,7 @@ export async function packSingleHtml(options = {}) {
   const outDir = path.isAbsolute(requestedOutDir)
     ? requestedOutDir
     : path.resolve(PROJECT_ROOT, requestedOutDir);
+  const useBase64 = typeof options.useBase64 === 'boolean' ? options.useBase64 : resolveUseBase64FromArgs();
   const compressImages = typeof options.compressImages === 'boolean'
     ? options.compressImages
     : resolveCompressImagesFromArgs();
@@ -996,7 +1084,7 @@ export async function packSingleHtml(options = {}) {
   const { manifest, blob, stats } = await buildBinaryPack(compressImages, imageQuality);
   const writtenFiles = [];
   for (const ch of CHANNELS) {
-    const out = inlineHtml(ch, manifest, blob);
+    const out = inlineHtml(ch, manifest, blob, useBase64);
     const outPath = path.join(outDir, `${ch}.html`);
     fs.writeFileSync(outPath, out, 'utf8');
     console.log('written:', outPath);
@@ -1011,6 +1099,7 @@ export async function packSingleHtml(options = {}) {
   return {
     outDir,
     files: writtenFiles,
+    useBase64,
     bundle: {
       fileCount: stats.fileCount,
       packedBytes: stats.packedBytes,
