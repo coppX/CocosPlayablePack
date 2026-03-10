@@ -12,6 +12,29 @@ const BUILD_DIR = path.join(PROJECT_ROOT, 'build', 'web-mobile');
 const CHANNELS = ['facebook', 'google', 'tiktok', 'mintegral', 'unityads', 'applovin', 'ironsource', 'kwai', 'vungle', 'snap'];
 const BRIDGE_JS = fs.readFileSync(path.join(SCRIPT_DIR, 'bridge.playable-sdk.js'), 'utf8');
 const B91_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!\"#$%&'()*+,-./:;=?@[]^_`{|}~";
+const MIME_BY_EXT = {
+  '.js': 'text/javascript',
+  '.mjs': 'text/javascript',
+  '.json': 'application/json',
+  '.css': 'text/css',
+  '.html': 'text/html',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.mp3': 'audio/mpeg',
+  '.ogg': 'audio/ogg',
+  '.wav': 'audio/wav',
+  '.bin': 'application/octet-stream',
+  '.ttf': 'font/ttf',
+  '.otf': 'font/otf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.mp4': 'video/mp4',
+  '.wasm': 'application/wasm',
+};
 
 // These files are inlined directly into HTML, so do not duplicate them into PACK.
 const INLINE_FILES = new Set([
@@ -144,29 +167,7 @@ function encodeBase91(buf) {
 
 function guessMime(rel) {
   const ext = path.extname(rel).toLowerCase();
-  return ({
-    '.js': 'text/javascript',
-    '.mjs': 'text/javascript',
-    '.json': 'application/json',
-    '.css': 'text/css',
-    '.html': 'text/html',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.webp': 'image/webp',
-    '.gif': 'image/gif',
-    '.svg': 'image/svg+xml',
-    '.mp3': 'audio/mpeg',
-    '.ogg': 'audio/ogg',
-    '.wav': 'audio/wav',
-    '.bin': 'application/octet-stream',
-    '.ttf': 'font/ttf',
-    '.otf': 'font/otf',
-    '.woff': 'font/woff',
-    '.woff2': 'font/woff2',
-    '.mp4': 'video/mp4',
-    '.wasm': 'application/wasm',
-  }[ext] || 'application/octet-stream');
+  return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
 function shouldPack(rel) {
@@ -358,63 +359,12 @@ async function compressImageBuffer(rel, buf, quality, compressor) {
 function makeVfsPatchScript() {
   return String.raw`
 (function(){
-  const LEGACY_PACK = window.__PACKED_FILES__ || {};
   const BIN_MANIFEST = window.__PACK_MANIFEST__ || {};
   const BIN_BLOB = window.__PACK_BLOB__ || null;
-  const PACK_KEYS = Array.from(new Set(Object.keys(LEGACY_PACK).concat(Object.keys(BIN_MANIFEST))));
+  const PACK_KEYS = Object.keys(BIN_MANIFEST);
   const RESOLVE_CACHE = Object.create(null);
   const ORIGIN_FETCH = window.fetch ? window.fetch.bind(window) : null;
-
-  const B64_TABLE = new Int16Array(128).fill(-1);
-  for (let i = 0; i < 26; i++) {
-    B64_TABLE[65 + i] = i; // A-Z
-    B64_TABLE[97 + i] = 26 + i; // a-z
-  }
-  for (let i = 0; i < 10; i++) B64_TABLE[48 + i] = 52 + i; // 0-9
-  B64_TABLE[43] = 62; // +
-  B64_TABLE[47] = 63; // /
-
-  function b64ToBytes(b64){
-    let clean = String(b64 || '')
-      .replace(/\s+/g, '')
-      .replace(/-/g, '+')
-      .replace(/_/g, '/')
-      .replace(/[^A-Za-z0-9+/=]/g, '');
-
-    if (!clean) return new Uint8Array(0);
-
-    clean = clean.replace(/=+$/g, '');
-    if (clean.length % 4 === 1) clean = clean.slice(0, -1);
-    if (clean.length % 4) clean += '='.repeat(4 - (clean.length % 4));
-
-    let pad = 0;
-    if (clean.endsWith('==')) pad = 2;
-    else if (clean.endsWith('=')) pad = 1;
-
-    const outLen = Math.max(0, ((clean.length >> 2) * 3) - pad);
-    const out = new Uint8Array(outLen);
-    let outIndex = 0;
-
-    for (let i = 0; i < clean.length; i += 4) {
-      const c1 = clean.charCodeAt(i);
-      const c2 = clean.charCodeAt(i + 1);
-      const c3 = clean.charCodeAt(i + 2);
-      const c4 = clean.charCodeAt(i + 3);
-
-      const v1 = c1 < 128 ? B64_TABLE[c1] : -1;
-      const v2 = c2 < 128 ? B64_TABLE[c2] : -1;
-      const v3 = c3 === 61 ? 0 : (c3 < 128 ? B64_TABLE[c3] : -1);
-      const v4 = c4 === 61 ? 0 : (c4 < 128 ? B64_TABLE[c4] : -1);
-      if (v1 < 0 || v2 < 0 || v3 < 0 || v4 < 0) throw new Error('Invalid base64 character');
-
-      const n = (v1 << 18) | (v2 << 12) | (v3 << 6) | v4;
-      if (outIndex < outLen) out[outIndex++] = (n >> 16) & 255;
-      if (c3 !== 61 && outIndex < outLen) out[outIndex++] = (n >> 8) & 255;
-      if (c4 !== 61 && outIndex < outLen) out[outIndex++] = n & 255;
-    }
-
-    return out;
-  }
+  const MIME_BY_EXT = ${JSON.stringify(MIME_BY_EXT)};
 
   function bytesToUtf8(u8){
     if (typeof TextDecoder !== 'undefined') {
@@ -425,26 +375,8 @@ function makeVfsPatchScript() {
     return decodeURIComponent(out);
   }
 
-  function utf8ToBytes(str){
-    if (typeof TextEncoder !== 'undefined') {
-      return new TextEncoder().encode(str);
-    }
-    const encoded = unescape(encodeURIComponent(str));
-    const out = new Uint8Array(encoded.length);
-    for (let i = 0; i < encoded.length; i++) out[i] = encoded.charCodeAt(i);
-    return out;
-  }
-
-  function latin1ToBytes(str){
-    const s = String(str || '');
-    const out = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i) & 255;
-    return out;
-  }
-
   function getHit(rel){
     if (!rel) return null;
-    if (Object.prototype.hasOwnProperty.call(LEGACY_PACK, rel)) return LEGACY_PACK[rel];
     if (Object.prototype.hasOwnProperty.call(BIN_MANIFEST, rel)) return BIN_MANIFEST[rel];
     return null;
   }
@@ -460,26 +392,10 @@ function makeVfsPatchScript() {
       if (end > BIN_BLOB.length) return null;
       return BIN_BLOB.subarray(o, end);
     }
-    if (hit && typeof hit === 'object' && hit.o != null && hit.l != null) {
-      const o = Number(hit.o);
-      const l = Number(hit.l);
-      if (!Number.isFinite(o) || !Number.isFinite(l) || o < 0 || l < 0) return null;
-      if (!BIN_BLOB || typeof BIN_BLOB.subarray !== 'function') return null;
-      const end = o + l;
-      if (end > BIN_BLOB.length) return null;
-      return BIN_BLOB.subarray(o, end);
-    }
-    if (hit.text != null) return utf8ToBytes(hit.text);
-    if (hit.b64 != null) return b64ToBytes(hit.b64);
-    if (hit.bin != null) return latin1ToBytes(hit.bin);
     return null;
   }
 
   function getEntryText(hit){
-    if (!hit) return null;
-    if (hit.text != null) return String(hit.text);
-    if (hit.b64 != null) return bytesToUtf8(b64ToBytes(hit.b64));
-    if (hit.bin != null) return bytesToUtf8(latin1ToBytes(hit.bin));
     const bytes = getEntryBytes(hit);
     if (!bytes) return null;
     return bytesToUtf8(bytes);
@@ -564,38 +480,15 @@ function makeVfsPatchScript() {
   function guessMime(rel){
     const extMatch = /\.([^.\/]+)$/.exec(String(rel || '').toLowerCase());
     const ext = extMatch ? '.' + extMatch[1] : '';
-    return ({
-      '.js': 'text/javascript',
-      '.mjs': 'text/javascript',
-      '.json': 'application/json',
-      '.css': 'text/css',
-      '.html': 'text/html',
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.webp': 'image/webp',
-      '.gif': 'image/gif',
-      '.svg': 'image/svg+xml',
-      '.mp3': 'audio/mpeg',
-      '.ogg': 'audio/ogg',
-      '.wav': 'audio/wav',
-      '.bin': 'application/octet-stream',
-      '.ttf': 'font/ttf',
-      '.otf': 'font/otf',
-      '.woff': 'font/woff',
-      '.woff2': 'font/woff2',
-      '.mp4': 'video/mp4',
-      '.wasm': 'application/wasm',
-    }[ext] || 'application/octet-stream');
+    return MIME_BY_EXT[ext] || 'application/octet-stream';
   }
 
-  function getEntryMime(rel, hit){
-    if (hit && typeof hit === 'object' && typeof hit.mime === 'string' && hit.mime) return hit.mime;
+  function getEntryMime(rel){
     return guessMime(rel);
   }
 
-  function isScriptLike(rel, hit){
-    const mime = String(getEntryMime(rel, hit) || '').toLowerCase();
+  function isScriptLike(rel){
+    const mime = String(getEntryMime(rel) || '').toLowerCase();
     return /javascript|ecmascript/.test(mime) || /\.(m?js)$/i.test(String(rel || ''));
   }
 
@@ -617,7 +510,7 @@ function makeVfsPatchScript() {
         const rel = resolveRel(norm(url));
         if (rel) {
           const hit = getHit(rel);
-          if (hit && getEntryText(hit) != null && isScriptLike(rel, hit)) return true;
+          if (hit && getEntryText(hit) != null && isScriptLike(rel)) return true;
         }
         return originalShouldFetch.call(this, url);
       };
@@ -657,11 +550,11 @@ function makeVfsPatchScript() {
         set: function(v){
           const rel = resolveRel(norm(v));
           const hit = rel && getHit(rel);
-          const scriptText = hit && isScriptLike(rel, hit) ? getEntryText(hit) : null;
+          const scriptText = hit && isScriptLike(rel) ? getEntryText(hit) : null;
           if (scriptText != null) {
             const URL_API = window.URL || window.webkitURL;
             if (URL_API && typeof URL_API.createObjectURL === 'function') {
-              const blob = new Blob([scriptText], { type: getEntryMime(rel, hit) || 'text/javascript' });
+              const blob = new Blob([scriptText], { type: getEntryMime(rel) || 'text/javascript' });
               const objectURL = URL_API.createObjectURL(blob);
               if (typeof this.addEventListener === 'function') {
                 const self = this;
@@ -711,7 +604,7 @@ function makeVfsPatchScript() {
 
         const rel = resolveRel(norm(src));
         const hit = rel && getHit(rel);
-        const scriptText = hit && isScriptLike(rel, hit) ? getEntryText(hit) : null;
+        const scriptText = hit && isScriptLike(rel) ? getEntryText(hit) : null;
         if (scriptText == null) return;
 
         try { if (typeof node.removeAttribute === 'function') node.removeAttribute('src'); } catch (e) {}
@@ -748,11 +641,11 @@ function makeVfsPatchScript() {
     if (!hit) return null;
 
     const bytes = getEntryBytes(hit);
-    if (!bytes && hit.text == null) return null;
-    const body = hit.text != null ? String(hit.text) : bytes;
+    if (!bytes) return null;
+    const body = bytes;
 
     const headers = new Headers((init && init.headers) || {});
-    if (!headers.has('Content-Type')) headers.set('Content-Type', getEntryMime(rel, hit));
+    if (!headers.has('Content-Type')) headers.set('Content-Type', getEntryMime(rel));
     return new Response(body, { status: 200, headers });
   }
 
@@ -803,10 +696,10 @@ function makeVfsPatchScript() {
       }
 
       try {
-        const mime = getEntryMime(rel, hit);
+        const mime = getEntryMime(rel);
         const bytes = getEntryBytes(hit);
-        if (!bytes && hit.text == null) return send.apply(this, arguments);
-        const payload = hit.text != null ? String(hit.text) : bytes;
+        if (!bytes) return send.apply(this, arguments);
+        const payload = bytes;
         const blob = new Blob([payload], { type: mime });
         const objectURL = URL_API.createObjectURL(blob);
         const self = this;
@@ -861,12 +754,9 @@ function makeVfsPatchScript() {
             const rel = resolveRel(norm(v));
             const hit = rel && getHit(rel);
             if (hit) {
-              if (hit && typeof hit === 'object' && hit.b64) {
-                return desc.set.call(img, 'data:' + getEntryMime(rel, hit) + ';base64,' + hit.b64);
-              }
               const bytes = getEntryBytes(hit);
               if (bytes) {
-                const b = new Blob([bytes], { type: getEntryMime(rel, hit) });
+                const b = new Blob([bytes], { type: getEntryMime(rel) });
                 const URL_API = window.URL || window.webkitURL;
                 if (URL_API && typeof URL_API.createObjectURL === 'function') {
                   const objectURL = URL_API.createObjectURL(b);
@@ -1011,7 +901,6 @@ function inlineHtml(channel, manifest, blob, useBase64) {
   try {
     window.__PACK_MANIFEST__ = JSON.parse(manifestText);
     window.__PACK_BLOB__ = decodePayload(payload);
-    if (!window.__PACKED_FILES__) window.__PACKED_FILES__ = {};
     for (let i = 0; i < nodes.length; i++) {
       if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
     }
@@ -1020,7 +909,6 @@ function inlineHtml(channel, manifest, blob, useBase64) {
     console.error('[pack-single-html] binary pack parse failed:', e && e.message ? e.message : e);
     window.__PACK_MANIFEST__ = {};
     window.__PACK_BLOB__ = new Uint8Array(0);
-    window.__PACKED_FILES__ = window.__PACKED_FILES__ || {};
   }
 })();</script>`;
 
