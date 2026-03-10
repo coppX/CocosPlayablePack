@@ -21,7 +21,6 @@ const INLINE_FILES = new Set([
 ]);
 
 const COMPRESSIBLE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
-const TEXT_LIKE_EXT = new Set(['.js', '.mjs', '.json', '.css', '.html', '.txt', '.xml', '.svg']);
 
 let jimpModuleCache;
 let jimpLoadErrorCache = null;
@@ -43,13 +42,6 @@ function resolveOutputDirFromArgs(args = process.argv.slice(2)) {
     return path.isAbsolute(raw) ? raw : path.resolve(PROJECT_ROOT, raw);
   }
   return path.join(PROJECT_ROOT, 'dist-playable');
-}
-
-function resolveUseBase64FromArgs(args = process.argv.slice(2)) {
-  const key = '--use-base64';
-  const idx = args.indexOf(key);
-  if (idx < 0) return true;
-  return parseBooleanLike(args[idx + 1], true);
 }
 
 function resolveCompressImagesFromArgs(args = process.argv.slice(2)) {
@@ -112,10 +104,6 @@ function escapeInlineStyle(source) {
   return String(source).replace(/<\/style/gi, '<\\/style');
 }
 
-function packedToBase64(packed) {
-  return Buffer.from(JSON.stringify(packed), 'utf8').toString('base64');
-}
-
 function guessMime(rel) {
   const ext = path.extname(rel).toLowerCase();
   return ({
@@ -147,14 +135,6 @@ function shouldPack(rel) {
   if (rel === 'index.html') return false;
   if (INLINE_FILES.has(rel)) return false;
   return true;
-}
-
-function isTextLike(rel, mime) {
-  const ext = path.extname(rel).toLowerCase();
-  if (TEXT_LIKE_EXT.has(ext)) return true;
-  if (String(mime || '').startsWith('text/')) return true;
-  if (mime === 'application/json') return true;
-  return false;
 }
 
 function isCompressibleImage(rel, mime) {
@@ -273,14 +253,19 @@ async function resolveImageCompressor(compressImages) {
   return { compressor: null, warning };
 }
 
-async function buildPackedFiles(useBase64, compressImages, imageQuality) {
+async function buildBinaryPack(compressImages, imageQuality) {
   const files = walk(BUILD_DIR);
-  /** @type {Record<string, {mime: string, text?: string, b64?: string, bin?: string}>} */
-  const packed = {};
+  /** @type {Record<string, [number, number]>} */
+  const manifest = {};
+  /** @type {Buffer[]} */
+  const chunks = [];
+  let blobOffset = 0;
   const stats = {
     compressedCount: 0,
     originalBytes: 0,
     compressedBytes: 0,
+    packedBytes: 0,
+    fileCount: 0,
     compressor: 'none',
   };
 
@@ -311,17 +296,18 @@ async function buildPackedFiles(useBase64, compressImages, imageQuality) {
       stats.compressedBytes += buf.length;
     }
 
-    if (useBase64) {
-      packed[rel] = { mime, b64: buf.toString('base64') };
-    } else if (isTextLike(rel, mime)) {
-      packed[rel] = { mime, text: buf.toString('utf8') };
-    } else {
-      // Keep binary data without base64 by preserving byte values in latin1 string.
-      packed[rel] = { mime, bin: buf.toString('latin1') };
-    }
+    manifest[rel] = [blobOffset, buf.length];
+    chunks.push(buf);
+    blobOffset += buf.length;
+    stats.fileCount += 1;
+    stats.packedBytes += buf.length;
   }
 
-  return { packed, stats };
+  return {
+    manifest,
+    blob: Buffer.concat(chunks),
+    stats,
+  };
 }
 
 async function compressImageBuffer(rel, buf, quality, compressor) {
@@ -332,12 +318,15 @@ async function compressImageBuffer(rel, buf, quality, compressor) {
 
 
 function makeVfsPatchScript() {
-  return `
+  return String.raw`
 (function(){
-  const PACK = window.__PACKED_FILES__ || {};
-  const PACK_KEYS = Object.keys(PACK);
+  const LEGACY_PACK = window.__PACKED_FILES__ || {};
+  const BIN_MANIFEST = window.__PACK_MANIFEST__ || {};
+  const BIN_BLOB = window.__PACK_BLOB__ || null;
+  const PACK_KEYS = Array.from(new Set(Object.keys(LEGACY_PACK).concat(Object.keys(BIN_MANIFEST))));
   const RESOLVE_CACHE = Object.create(null);
   const ORIGIN_FETCH = window.fetch ? window.fetch.bind(window) : null;
+
   const B64_TABLE = new Int16Array(128).fill(-1);
   for (let i = 0; i < 26; i++) {
     B64_TABLE[65 + i] = i; // A-Z
@@ -349,7 +338,7 @@ function makeVfsPatchScript() {
 
   function b64ToBytes(b64){
     let clean = String(b64 || '')
-      .replace(/\\s+/g, '')
+      .replace(/\s+/g, '')
       .replace(/-/g, '+')
       .replace(/_/g, '/')
       .replace(/[^A-Za-z0-9+/=]/g, '');
@@ -357,10 +346,7 @@ function makeVfsPatchScript() {
     if (!clean) return new Uint8Array(0);
 
     clean = clean.replace(/=+$/g, '');
-    if (clean.length % 4 === 1) {
-      // Keep decoder resilient in hostile WebView transforms.
-      clean = clean.slice(0, -1);
-    }
+    if (clean.length % 4 === 1) clean = clean.slice(0, -1);
     if (clean.length % 4) clean += '='.repeat(4 - (clean.length % 4));
 
     let pad = 0;
@@ -418,8 +404,33 @@ function makeVfsPatchScript() {
     return out;
   }
 
+  function getHit(rel){
+    if (!rel) return null;
+    if (Object.prototype.hasOwnProperty.call(LEGACY_PACK, rel)) return LEGACY_PACK[rel];
+    if (Object.prototype.hasOwnProperty.call(BIN_MANIFEST, rel)) return BIN_MANIFEST[rel];
+    return null;
+  }
+
   function getEntryBytes(hit){
     if (!hit) return null;
+    if (Array.isArray(hit) && hit.length >= 2) {
+      const o = Number(hit[0]);
+      const l = Number(hit[1]);
+      if (!Number.isFinite(o) || !Number.isFinite(l) || o < 0 || l < 0) return null;
+      if (!BIN_BLOB || typeof BIN_BLOB.subarray !== 'function') return null;
+      const end = o + l;
+      if (end > BIN_BLOB.length) return null;
+      return BIN_BLOB.subarray(o, end);
+    }
+    if (hit && typeof hit === 'object' && hit.o != null && hit.l != null) {
+      const o = Number(hit.o);
+      const l = Number(hit.l);
+      if (!Number.isFinite(o) || !Number.isFinite(l) || o < 0 || l < 0) return null;
+      if (!BIN_BLOB || typeof BIN_BLOB.subarray !== 'function') return null;
+      const end = o + l;
+      if (end > BIN_BLOB.length) return null;
+      return BIN_BLOB.subarray(o, end);
+    }
     if (hit.text != null) return utf8ToBytes(hit.text);
     if (hit.b64 != null) return b64ToBytes(hit.b64);
     if (hit.bin != null) return latin1ToBytes(hit.bin);
@@ -431,7 +442,9 @@ function makeVfsPatchScript() {
     if (hit.text != null) return String(hit.text);
     if (hit.b64 != null) return bytesToUtf8(b64ToBytes(hit.b64));
     if (hit.bin != null) return bytesToUtf8(latin1ToBytes(hit.bin));
-    return null;
+    const bytes = getEntryBytes(hit);
+    if (!bytes) return null;
+    return bytesToUtf8(bytes);
   }
 
   function stripQueryHash(u){
@@ -440,7 +453,7 @@ function makeVfsPatchScript() {
   }
 
   function collapsePath(p){
-    const segs = String(p || '').replace(/\\\\/g, '/').split('/');
+    const segs = String(p || '').replace(/\\/g, '/').split('/');
     const out = [];
     for (const seg of segs) {
       if (!seg || seg === '.') continue;
@@ -460,15 +473,15 @@ function makeVfsPatchScript() {
       if (typeof url !== 'string') url = String(url);
       url = stripQueryHash(url);
       if (/^(data:|blob:|javascript:)/i.test(url)) return null;
-      if (/^https?:\\/\\//i.test(url)) {
+      if (/^https?:\/\//i.test(url)) {
         const U = new URL(url);
         url = U.pathname;
-      } else if (/^file:\\/\\//i.test(url)) {
+      } else if (/^file:\/\//i.test(url)) {
         const U = new URL(url);
         url = decodeURIComponent(U.pathname || '');
-        if (/^\\/[A-Za-z]:\\//.test(url)) url = url.slice(1);
+        if (/^\/[A-Za-z]:\//.test(url)) url = url.slice(1);
       }
-      url = url.replace(/^\\//, '');
+      url = url.replace(/^\//, '');
       if (url.startsWith('./')) url = url.slice(2);
       return collapsePath(url);
     } catch (e) {
@@ -477,7 +490,7 @@ function makeVfsPatchScript() {
   }
 
   function has(rel){
-    return rel && Object.prototype.hasOwnProperty.call(PACK, rel);
+    return rel && getHit(rel) != null;
   }
 
   function resolveRel(rel){
@@ -492,7 +505,7 @@ function makeVfsPatchScript() {
       return normalized;
     }
 
-    normalized = normalized.replace(/^(\\.\\.\\/)+/, '');
+    normalized = normalized.replace(/^(\.\.\/)+/, '');
     if (has(normalized)) {
       RESOLVE_CACHE[rel] = normalized;
       return normalized;
@@ -510,9 +523,42 @@ function makeVfsPatchScript() {
     return null;
   }
 
+  function guessMime(rel){
+    const extMatch = /\.([^.\/]+)$/.exec(String(rel || '').toLowerCase());
+    const ext = extMatch ? '.' + extMatch[1] : '';
+    return ({
+      '.js': 'text/javascript',
+      '.mjs': 'text/javascript',
+      '.json': 'application/json',
+      '.css': 'text/css',
+      '.html': 'text/html',
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif',
+      '.svg': 'image/svg+xml',
+      '.mp3': 'audio/mpeg',
+      '.ogg': 'audio/ogg',
+      '.wav': 'audio/wav',
+      '.bin': 'application/octet-stream',
+      '.ttf': 'font/ttf',
+      '.otf': 'font/otf',
+      '.woff': 'font/woff',
+      '.woff2': 'font/woff2',
+      '.mp4': 'video/mp4',
+      '.wasm': 'application/wasm',
+    }[ext] || 'application/octet-stream');
+  }
+
+  function getEntryMime(rel, hit){
+    if (hit && typeof hit === 'object' && typeof hit.mime === 'string' && hit.mime) return hit.mime;
+    return guessMime(rel);
+  }
+
   function isScriptLike(rel, hit){
-    const mime = String((hit && hit.mime) || '').toLowerCase();
-    return /javascript|ecmascript/.test(mime) || /\\.(m?js)$/i.test(String(rel || ''));
+    const mime = String(getEntryMime(rel, hit) || '').toLowerCase();
+    return /javascript|ecmascript/.test(mime) || /\.(m?js)$/i.test(String(rel || ''));
   }
 
   function patchSystemShouldFetch(){
@@ -532,7 +578,7 @@ function makeVfsPatchScript() {
       proto.shouldFetch = function(url){
         const rel = resolveRel(norm(url));
         if (rel) {
-          const hit = PACK[rel];
+          const hit = getHit(rel);
           if (hit && getEntryText(hit) != null && isScriptLike(rel, hit)) return true;
         }
         return originalShouldFetch.call(this, url);
@@ -572,12 +618,12 @@ function makeVfsPatchScript() {
         },
         set: function(v){
           const rel = resolveRel(norm(v));
-          const hit = rel && PACK[rel];
+          const hit = rel && getHit(rel);
           const scriptText = hit && isScriptLike(rel, hit) ? getEntryText(hit) : null;
           if (scriptText != null) {
             const URL_API = window.URL || window.webkitURL;
             if (URL_API && typeof URL_API.createObjectURL === 'function') {
-              const blob = new Blob([scriptText], { type: hit.mime || 'text/javascript' });
+              const blob = new Blob([scriptText], { type: getEntryMime(rel, hit) || 'text/javascript' });
               const objectURL = URL_API.createObjectURL(blob);
               if (typeof this.addEventListener === 'function') {
                 const self = this;
@@ -600,7 +646,6 @@ function makeVfsPatchScript() {
         const origSetAttribute = proto.setAttribute;
         proto.setAttribute = function(name, value){
           if (String(name || '').toLowerCase() === 'src') {
-            // Route through the patched src setter so VFS rewrite runs.
             this.src = value;
             return;
           }
@@ -627,7 +672,7 @@ function makeVfsPatchScript() {
         }
 
         const rel = resolveRel(norm(src));
-        const hit = rel && PACK[rel];
+        const hit = rel && getHit(rel);
         const scriptText = hit && isScriptLike(rel, hit) ? getEntryText(hit) : null;
         if (scriptText == null) return;
 
@@ -661,16 +706,15 @@ function makeVfsPatchScript() {
   }
 
   function toResponse(rel, init){
-    const hit = PACK[rel];
+    const hit = getHit(rel);
     if (!hit) return null;
 
-    const mime = hit.mime || 'application/octet-stream';
     const bytes = getEntryBytes(hit);
-    if (!bytes) return null;
-    const body = hit.text != null ? hit.text : bytes;
+    if (!bytes && hit.text == null) return null;
+    const body = hit.text != null ? String(hit.text) : bytes;
 
     const headers = new Headers((init && init.headers) || {});
-    if (!headers.has('Content-Type')) headers.set('Content-Type', mime);
+    if (!headers.has('Content-Type')) headers.set('Content-Type', getEntryMime(rel, hit));
     return new Response(body, { status: 200, headers });
   }
 
@@ -712,7 +756,7 @@ function makeVfsPatchScript() {
 
     XHR.prototype.send = function(body){
       const rel = resolveRel(norm(this.__vfs_url__));
-      const hit = rel && PACK[rel];
+      const hit = rel && getHit(rel);
       if (!hit) return send.apply(this, arguments);
 
       const URL_API = window.URL || window.webkitURL;
@@ -721,10 +765,10 @@ function makeVfsPatchScript() {
       }
 
       try {
-        const mime = hit.mime || 'application/octet-stream';
+        const mime = getEntryMime(rel, hit);
         const bytes = getEntryBytes(hit);
         if (!bytes && hit.text == null) return send.apply(this, arguments);
-        const payload = hit.text != null ? hit.text : bytes;
+        const payload = hit.text != null ? String(hit.text) : bytes;
         const blob = new Blob([payload], { type: mime });
         const objectURL = URL_API.createObjectURL(blob);
         const self = this;
@@ -777,14 +821,14 @@ function makeVfsPatchScript() {
         Object.defineProperty(img, 'src', {
           set(v){
             const rel = resolveRel(norm(v));
-            const hit = rel && PACK[rel];
+            const hit = rel && getHit(rel);
             if (hit) {
-              if (hit.b64) {
-                return desc.set.call(img, 'data:' + (hit.mime || 'application/octet-stream') + ';base64,' + hit.b64);
+              if (hit && typeof hit === 'object' && hit.b64) {
+                return desc.set.call(img, 'data:' + getEntryMime(rel, hit) + ';base64,' + hit.b64);
               }
               const bytes = getEntryBytes(hit);
               if (bytes) {
-                const b = new Blob([bytes], { type: hit.mime || 'application/octet-stream' });
+                const b = new Blob([bytes], { type: getEntryMime(rel, hit) });
                 const URL_API = window.URL || window.webkitURL;
                 if (URL_API && typeof URL_API.createObjectURL === 'function') {
                   const objectURL = URL_API.createObjectURL(b);
@@ -807,30 +851,30 @@ function sha1(s) {
   return crypto.createHash('sha1').update(s).digest('hex').slice(0, 10);
 }
 
-function inlineHtml(channel, packed, useBase64) {
+function inlineHtml(channel, manifest, blob) {
   let html = fs.readFileSync(path.join(BUILD_DIR, 'index.html'), 'utf8');
-  const packedJson = JSON.stringify(packed);
+  const manifestJson = JSON.stringify(manifest);
+  const blobB64 = blob.toString('base64');
   const PACK_CHUNK_SIZE = 256 * 1024;
 
-  let packedChunkTags = '';
-  let packedBootstrap = '';
-  if (useBase64) {
-    const packedB64 = Buffer.from(packedJson, 'utf8').toString('base64');
-    const packedB64Chunks = [];
-    for (let i = 0; i < packedB64.length; i += PACK_CHUNK_SIZE) {
-      packedB64Chunks.push(packedB64.slice(i, i + PACK_CHUNK_SIZE));
-    }
-    packedChunkTags = packedB64Chunks
-      .map((chunk, idx) => `<script class="__PACK_B64_CHUNK__" data-idx="${idx}" type="application/octet-stream">${chunk}</script>`)
-      .join('\n');
+  const blobB64Chunks = [];
+  for (let i = 0; i < blobB64.length; i += PACK_CHUNK_SIZE) {
+    blobB64Chunks.push(blobB64.slice(i, i + PACK_CHUNK_SIZE));
+  }
+  const packedChunkTags = blobB64Chunks
+    .map((chunk, idx) => `<script class="__PACK_BIN_CHUNK__" data-idx="${idx}" type="application/octet-stream">${chunk}</script>`)
+    .join('\n');
+  const manifestTag = `<script id="__PACK_MANIFEST__" type="application/octet-stream">${escapeInlineScript(manifestJson)}</script>`;
 
-    packedBootstrap = `<script>(function(){
-  const nodes = document.querySelectorAll('script.__PACK_B64_CHUNK__');
+  const packedBootstrap = `<script>(function(){
+  const nodes = document.querySelectorAll('script.__PACK_BIN_CHUNK__');
+  const manifestNode = document.getElementById('__PACK_MANIFEST__');
   let b64 = '';
   for (let i = 0; i < nodes.length; i++) {
     b64 += nodes[i].textContent || '';
   }
   b64 = b64.replace(/\\s+/g, '');
+  const manifestText = manifestNode ? (manifestNode.textContent || '{}') : '{}';
   const B64_TABLE = new Int16Array(128).fill(-1);
   for (let i = 0; i < 26; i++) {
     B64_TABLE[65 + i] = i;
@@ -877,48 +921,21 @@ function inlineHtml(channel, packed, useBase64) {
     }
     return out;
   }
-  function bytesToUtf8(u8){
-    if (typeof TextDecoder !== 'undefined') return new TextDecoder().decode(u8);
-    let s = '';
-    for (let i = 0; i < u8.length; i++) s += '%' + u8[i].toString(16).padStart(2, '0');
-    return decodeURIComponent(s);
-  }
   try {
-    window.__PACKED_FILES__ = JSON.parse(bytesToUtf8(b64ToBytes(b64)));
+    window.__PACK_MANIFEST__ = JSON.parse(manifestText);
+    window.__PACK_BLOB__ = b64ToBytes(b64);
+    if (!window.__PACKED_FILES__) window.__PACKED_FILES__ = {};
     for (let i = 0; i < nodes.length; i++) {
       if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
     }
+    if (manifestNode && manifestNode.parentNode) manifestNode.parentNode.removeChild(manifestNode);
   } catch (e) {
-    console.error('[pack-single-html] packed payload parse failed:', e && e.message ? e.message : e);
-    window.__PACKED_FILES__ = {};
+    console.error('[pack-single-html] binary pack parse failed:', e && e.message ? e.message : e);
+    window.__PACK_MANIFEST__ = {};
+    window.__PACK_BLOB__ = new Uint8Array(0);
+    window.__PACKED_FILES__ = window.__PACKED_FILES__ || {};
   }
 })();</script>`;
-  } else {
-    const packedJsonChunks = [];
-    for (let i = 0; i < packedJson.length; i += PACK_CHUNK_SIZE) {
-      packedJsonChunks.push(packedJson.slice(i, i + PACK_CHUNK_SIZE));
-    }
-    packedChunkTags = packedJsonChunks
-      .map((chunk, idx) => `<script class="__PACK_JSON_CHUNK__" data-idx="${idx}" type="application/json">${escapeInlineScript(chunk)}</script>`)
-      .join('\n');
-
-    packedBootstrap = `<script>(function(){
-  const nodes = document.querySelectorAll('script.__PACK_JSON_CHUNK__');
-  let json = '';
-  for (let i = 0; i < nodes.length; i++) {
-    json += nodes[i].textContent || '';
-  }
-  try {
-    window.__PACKED_FILES__ = JSON.parse(json);
-    for (let i = 0; i < nodes.length; i++) {
-      if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
-    }
-  } catch (e) {
-    console.error('[pack-single-html] packed payload parse failed:', e && e.message ? e.message : e);
-    window.__PACKED_FILES__ = {};
-  }
-})();</script>`;
-  }
 
   if (!/<link[^>]+rel=["']icon["']/i.test(html)) {
     html = html.replace(/<head>/i, '<head>\n  <link rel="icon" href="data:,">');
@@ -946,6 +963,7 @@ function inlineHtml(channel, packed, useBase64) {
 
   const injected =
 `<script>window.__CHANNEL__=${JSON.stringify(channel)};</script>
+${manifestTag}
 ${packedChunkTags}
 ${packedBootstrap}
 <script>${escapeInlineScript(makeVfsPatchScript())}</script>
@@ -957,7 +975,7 @@ ${packedBootstrap}
     injected + '\n$&'
   );
 
-  html = html.replace(/<title>.*?<\/title>/i, `<title>Playable-${channel}-${sha1(channel + String(Object.keys(packed).length))}</title>`);
+  html = html.replace(/<title>.*?<\/title>/i, `<title>Playable-${channel}-${sha1(channel + String(Object.keys(manifest).length))}</title>`);
 
   return html;
 }
@@ -967,7 +985,6 @@ export async function packSingleHtml(options = {}) {
   const outDir = path.isAbsolute(requestedOutDir)
     ? requestedOutDir
     : path.resolve(PROJECT_ROOT, requestedOutDir);
-  const useBase64 = typeof options.useBase64 === 'boolean' ? options.useBase64 : resolveUseBase64FromArgs();
   const compressImages = typeof options.compressImages === 'boolean'
     ? options.compressImages
     : resolveCompressImagesFromArgs();
@@ -976,10 +993,10 @@ export async function packSingleHtml(options = {}) {
     : resolveImageQualityFromArgs();
   fs.mkdirSync(outDir, { recursive: true });
 
-  const { packed, stats } = await buildPackedFiles(useBase64, compressImages, imageQuality);
+  const { manifest, blob, stats } = await buildBinaryPack(compressImages, imageQuality);
   const writtenFiles = [];
   for (const ch of CHANNELS) {
-    const out = inlineHtml(ch, packed, useBase64);
+    const out = inlineHtml(ch, manifest, blob);
     const outPath = path.join(outDir, `${ch}.html`);
     fs.writeFileSync(outPath, out, 'utf8');
     console.log('written:', outPath);
@@ -994,6 +1011,10 @@ export async function packSingleHtml(options = {}) {
   return {
     outDir,
     files: writtenFiles,
+    bundle: {
+      fileCount: stats.fileCount,
+      packedBytes: stats.packedBytes,
+    },
     imageCompression: {
       enabled: compressImages,
       quality: imageQuality,
