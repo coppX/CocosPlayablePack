@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
@@ -45,6 +46,8 @@ const INLINE_FILES = new Set([
 ]);
 
 const COMPRESSIBLE_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp']);
+const BLOB_COMPRESSION_NONE = 'none';
+const BLOB_COMPRESSION_GZIP = 'gzip';
 
 let jimpModuleCache;
 let jimpLoadErrorCache = null;
@@ -89,6 +92,32 @@ function resolveImageQualityFromArgs(args = process.argv.slice(2)) {
   const n = Number(args[idx + 1]);
   if (!Number.isFinite(n)) return 72;
   return Math.max(1, Math.min(100, Math.round(n)));
+}
+
+function normalizeBlobCompression(raw, fallback = BLOB_COMPRESSION_NONE) {
+  if (raw == null) return fallback;
+  const value = String(raw).trim().toLowerCase();
+  if (!value) return fallback;
+  if (value === BLOB_COMPRESSION_GZIP) return BLOB_COMPRESSION_GZIP;
+  if (value === BLOB_COMPRESSION_NONE || value === 'off' || value === 'false' || value === '0') {
+    return BLOB_COMPRESSION_NONE;
+  }
+  return fallback;
+}
+
+function resolveBlobCompressionFromArgs(args = process.argv.slice(2)) {
+  const key = '--blob-compression';
+  const idx = args.indexOf(key);
+  if (idx >= 0) {
+    return normalizeBlobCompression(args[idx + 1], BLOB_COMPRESSION_NONE);
+  }
+
+  const legacyToggleKey = '--compress-blob';
+  const toggleIdx = args.indexOf(legacyToggleKey);
+  if (toggleIdx < 0) return BLOB_COMPRESSION_NONE;
+  return parseBooleanLike(args[toggleIdx + 1], false)
+    ? BLOB_COMPRESSION_GZIP
+    : BLOB_COMPRESSION_NONE;
 }
 
 function isMainModule() {
@@ -369,10 +398,35 @@ function buildPackChunkTags(chunks) {
     .join('\n');
 }
 
+function compressBlobForPayload(blob, compression) {
+  const selected = normalizeBlobCompression(compression, BLOB_COMPRESSION_NONE);
+  const inputBytes = blob.length;
+
+  if (selected === BLOB_COMPRESSION_GZIP) {
+    const gz = zlib.gzipSync(blob, { level: zlib.constants.Z_BEST_COMPRESSION });
+    if (gz.length < blob.length) {
+      return {
+        compression: BLOB_COMPRESSION_GZIP,
+        blob: gz,
+        inputBytes,
+        outputBytes: gz.length,
+      };
+    }
+  }
+
+  return {
+    compression: BLOB_COMPRESSION_NONE,
+    blob,
+    inputBytes,
+    outputBytes: blob.length,
+  };
+}
+
 
 function makeVfsPatchScript() {
   return String.raw`
 (function(){
+  function install(){
   const BIN_MANIFEST = window.__PACK_MANIFEST__ || {};
   const BIN_BLOB = window.__PACK_BLOB__ || null;
   const PACK_KEYS = Object.keys(BIN_MANIFEST);
@@ -802,6 +856,15 @@ function makeVfsPatchScript() {
     };
     window.Image.prototype = _Image.prototype;
   }
+  }
+
+  const ready = window.__PACK_BOOTSTRAP_READY__;
+  if (ready && typeof ready.then === 'function') {
+    ready.then(function(){ install(); }).catch(function(){ install(); });
+    return;
+  }
+
+  install();
 })();`.trim();
 }
 
@@ -844,9 +907,10 @@ function inlineImportMapAsset(html, relPath) {
   return html.replace(re, inlineImportMapTag(readText(relPath)));
 }
 
-function makePackBootstrapScript(useBase64) {
+function makePackBootstrapScript(useBase64, blobCompression) {
   return `<script>(function(){
   const PACK_ENCODING = ${JSON.stringify(useBase64 ? 'base64' : 'base91')};
+  const PACK_BLOB_COMPRESSION = ${JSON.stringify(blobCompression)};
   const B91_ALPHABET = ${JSON.stringify(B91_ALPHABET)};
   const nodes = document.querySelectorAll('script.__PACK_BIN_CHUNK__');
   const manifestNode = document.getElementById('__PACK_MANIFEST__');
@@ -949,22 +1013,57 @@ function makePackBootstrapScript(useBase64) {
     return b64ToBytes(raw);
   }
 
-  try {
-    window.__PACK_MANIFEST__ = JSON.parse(manifestText);
-    window.__PACK_BLOB__ = decodePayload(payload);
-    for (let i = 0; i < nodes.length; i++) {
-      if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
+  async function maybeDecompress(bytes){
+    if (PACK_BLOB_COMPRESSION === 'none') return bytes;
+
+    if (PACK_BLOB_COMPRESSION === 'gzip') {
+      if (typeof DecompressionStream === 'undefined') {
+        throw new Error('DecompressionStream is not available for gzip blob layer.');
+      }
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+      const out = await new Response(stream).arrayBuffer();
+      return new Uint8Array(out);
     }
-    if (manifestNode && manifestNode.parentNode) manifestNode.parentNode.removeChild(manifestNode);
-  } catch (e) {
-    console.error('[pack-single-html] binary pack parse failed:', e && e.message ? e.message : e);
-    window.__PACK_MANIFEST__ = {};
-    window.__PACK_BLOB__ = new Uint8Array(0);
+
+    throw new Error('Unsupported blob compression: ' + PACK_BLOB_COMPRESSION);
   }
+
+  window.__PACK_BOOTSTRAP_READY__ = (async function(){
+    try {
+      window.__PACK_MANIFEST__ = JSON.parse(manifestText);
+      const decoded = decodePayload(payload);
+      window.__PACK_BLOB__ = await maybeDecompress(decoded);
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i] && nodes[i].parentNode) nodes[i].parentNode.removeChild(nodes[i]);
+      }
+      if (manifestNode && manifestNode.parentNode) manifestNode.parentNode.removeChild(manifestNode);
+    } catch (e) {
+      console.error('[pack-single-html] binary pack parse failed:', e && e.message ? e.message : e);
+      window.__PACK_MANIFEST__ = {};
+      window.__PACK_BLOB__ = new Uint8Array(0);
+    }
+  })();
 })();</script>`;
 }
 
-function inlineHtml(channel, manifest, blob, useBase64) {
+function makeSystemImportStartScript() {
+  return `<script>(function(){
+  function start(){
+    System.import('./index.js').catch(function(err) { console.error(err); });
+  }
+  const ready = window.__PACK_BOOTSTRAP_READY__;
+  if (ready && typeof ready.then === 'function') {
+    ready.then(start).catch(function(err){
+      console.error('[pack-single-html] bootstrap wait failed:', err && err.message ? err.message : err);
+      start();
+    });
+    return;
+  }
+  start();
+})();</script>`;
+}
+
+function inlineHtml(channel, manifest, blob, useBase64, blobCompression) {
   let html = fs.readFileSync(path.join(BUILD_DIR, 'index.html'), 'utf8');
   const manifestJson = JSON.stringify(manifest);
   const blobPayload = useBase64 ? blob.toString('base64') : encodeBase91(blob);
@@ -973,7 +1072,8 @@ function inlineHtml(channel, manifest, blob, useBase64) {
   const blobChunks = chunkString(blobPayload, PACK_CHUNK_SIZE);
   const packedChunkTags = buildPackChunkTags(blobChunks);
   const manifestTag = `<script id="__PACK_MANIFEST__" type="application/octet-stream">${escapeInlineScript(manifestJson)}</script>`;
-  const packedBootstrap = makePackBootstrapScript(useBase64);
+  const packedBootstrap = makePackBootstrapScript(useBase64, blobCompression);
+  const startScript = makeSystemImportStartScript();
 
   html = addFaviconIfMissing(html);
   html = inlineStyleIfPresent(html);
@@ -992,7 +1092,7 @@ ${packedBootstrap}
 
   html = html.replace(
     /<script[^>]*>\s*System\.import\((['"])\.\/index\.js\1\)[\s\S]*?<\/script>/i,
-    (matched) => `${injected}\n${matched}`
+    () => `${injected}\n${startScript}`
   );
 
   html = html.replace(/<title>.*?<\/title>/i, `<title>Playable-${channel}-${sha1(channel + String(Object.keys(manifest).length))}</title>`);
@@ -1006,6 +1106,9 @@ export async function packSingleHtml(options = {}) {
     ? requestedOutDir
     : path.resolve(PROJECT_ROOT, requestedOutDir);
   const useBase64 = typeof options.useBase64 === 'boolean' ? options.useBase64 : resolveUseBase64FromArgs();
+  const requestedBlobCompression = typeof options.blobCompression === 'string'
+    ? normalizeBlobCompression(options.blobCompression, BLOB_COMPRESSION_NONE)
+    : resolveBlobCompressionFromArgs();
   const compressImages = typeof options.compressImages === 'boolean'
     ? options.compressImages
     : resolveCompressImagesFromArgs();
@@ -1015,13 +1118,21 @@ export async function packSingleHtml(options = {}) {
   fs.mkdirSync(outDir, { recursive: true });
 
   const { manifest, blob, stats } = await buildBinaryPack(compressImages, imageQuality);
+  const blobPack = compressBlobForPayload(blob, requestedBlobCompression);
   const writtenFiles = [];
   for (const ch of CHANNELS) {
-    const out = inlineHtml(ch, manifest, blob, useBase64);
+    const out = inlineHtml(ch, manifest, blobPack.blob, useBase64, blobPack.compression);
     const outPath = path.join(outDir, `${ch}.html`);
     fs.writeFileSync(outPath, out, 'utf8');
     console.log('written:', outPath);
     writtenFiles.push(outPath);
+  }
+
+  if (requestedBlobCompression !== BLOB_COMPRESSION_NONE) {
+    const saved = Math.max(0, blobPack.inputBytes - blobPack.outputBytes);
+    console.log(
+      `[pack-single-html] blob=${blobPack.compression} requested=${requestedBlobCompression} saved=${saved}B (${blobPack.inputBytes} -> ${blobPack.outputBytes})`
+    );
   }
 
   if (compressImages && stats.compressor !== 'none') {
@@ -1033,6 +1144,12 @@ export async function packSingleHtml(options = {}) {
     outDir,
     files: writtenFiles,
     useBase64,
+    blobCompression: {
+      requested: requestedBlobCompression,
+      applied: blobPack.compression,
+      inputBytes: blobPack.inputBytes,
+      outputBytes: blobPack.outputBytes,
+    },
     bundle: {
       fileCount: stats.fileCount,
       packedBytes: stats.packedBytes,

@@ -1,4 +1,5 @@
 {
   "outputDir": "dist-playable",
-  "useBase64": true
+  "useBase64": false,
+  "blobCompression": "gzip"
 }

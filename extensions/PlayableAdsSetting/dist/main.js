@@ -17,6 +17,7 @@ const PANEL_NAME_CANDIDATES = [
 ];
 const OUTPUT_DIR_DEFAULT = 'dist-playable';
 const USE_BASE64_DEFAULT = true;
+const BLOB_COMPRESSION_DEFAULT = 'none';
 const OUTPUT_DIR_SETTINGS_FILE = path.join('settings', 'v2', 'packages', 'playable-ads-setting.json');
 
 function normalizeOutputDir(input) {
@@ -32,6 +33,15 @@ function normalizeUseBase64(input) {
 	return true;
 }
 
+function normalizeBlobCompression(input) {
+	const v = String(input ?? '').trim().toLowerCase();
+	if (!v) return BLOB_COMPRESSION_DEFAULT;
+	if (v === 'gzip' || v === '1' || v === 'true' || v === 'yes' || v === 'on') {
+		return 'gzip';
+	}
+	return 'none';
+}
+
 function resolveOutputDirAbsolute(projectPath, outputDir) {
 	return path.isAbsolute(outputDir) ? outputDir : path.join(projectPath, outputDir);
 }
@@ -45,6 +55,7 @@ function loadBuildConfig(projectPath) {
 	const defaults = {
 		outputDir: OUTPUT_DIR_DEFAULT,
 		useBase64: USE_BASE64_DEFAULT,
+		blobCompression: BLOB_COMPRESSION_DEFAULT,
 	};
 	try {
 		if (!fs.existsSync(settingsPath)) return defaults;
@@ -53,6 +64,7 @@ function loadBuildConfig(projectPath) {
 		return {
 			outputDir: normalizeOutputDir(json.outputDir),
 			useBase64: normalizeUseBase64(json.useBase64),
+			blobCompression: normalizeBlobCompression(json.blobCompression),
 		};
 	} catch {
 		return defaults;
@@ -64,6 +76,7 @@ function saveBuildConfig(projectPath, patch) {
 	const next = {
 		outputDir: normalizeOutputDir(patch.outputDir ?? current.outputDir),
 		useBase64: normalizeUseBase64(patch.useBase64 ?? current.useBase64),
+		blobCompression: normalizeBlobCompression(patch.blobCompression ?? current.blobCompression),
 	};
 	const settingsPath = getOutputSettingsPath(projectPath);
 	fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
@@ -87,6 +100,14 @@ function saveUseBase64Setting(projectPath, useBase64) {
 	return saveBuildConfig(projectPath, { useBase64: normalizeUseBase64(useBase64) }).useBase64;
 }
 
+function loadBlobCompressionSetting(projectPath) {
+	return loadBuildConfig(projectPath).blobCompression;
+}
+
+function saveBlobCompressionSetting(projectPath, blobCompression) {
+	return saveBuildConfig(projectPath, { blobCompression: normalizeBlobCompression(blobCompression) }).blobCompression;
+}
+
 function openDirectoryInOS(absDir) {
 	return new Promise((resolve) => {
 		const platform = process.platform;
@@ -101,7 +122,7 @@ function openDirectoryInOS(absDir) {
 }
 const dynamicImport = new Function('u', 'return import(u);');
 
-async function runPackInProcess(projectPath, scriptPath, normalizedOutputDir, useBase64, outputDirAbs) {
+async function runPackInProcess(projectPath, scriptPath, normalizedOutputDir, useBase64, blobCompression, outputDirAbs) {
 	const oldCwd = process.cwd();
 	try {
 		process.chdir(projectPath);
@@ -112,7 +133,7 @@ async function runPackInProcess(projectPath, scriptPath, normalizedOutputDir, us
 			throw new Error('pack-single-html.mjs does not export packSingleHtml().');
 		}
 
-		const result = await mod.packSingleHtml({ outDir: normalizedOutputDir, useBase64 });
+		const result = await mod.packSingleHtml({ outDir: normalizedOutputDir, useBase64, blobCompression });
 		const files = Array.isArray(result?.files) ? result.files : [];
 
 		return {
@@ -122,6 +143,7 @@ async function runPackInProcess(projectPath, scriptPath, normalizedOutputDir, us
 			stderr: '',
 			outputDir: outputDirAbs,
 			useBase64,
+			blobCompression,
 		};
 	} catch (err) {
 		return {
@@ -131,18 +153,19 @@ async function runPackInProcess(projectPath, scriptPath, normalizedOutputDir, us
 			stderr: String(err),
 			outputDir: outputDirAbs,
 			useBase64,
+			blobCompression,
 		};
 	} finally {
 		process.chdir(oldCwd);
 	}
 }
 
-async function runPlayableBuild(outputDir, useBase64) {
+async function runPlayableBuild(outputDir, useBase64, blobCompression) {
 	const projectPath = Editor.Project.path;
 	const normalizedOutputDir = normalizeOutputDir(outputDir);
 	const outputDirAbs = resolveOutputDirAbsolute(projectPath, normalizedOutputDir);
 	const scriptPath = path.join(projectPath, 'tools', 'playable', 'pack-single-html.mjs');
-	return runPackInProcess(projectPath, scriptPath, normalizedOutputDir, useBase64, outputDirAbs);
+	return runPackInProcess(projectPath, scriptPath, normalizedOutputDir, useBase64, blobCompression, outputDirAbs);
 }
 
 exports.methods = {
@@ -158,14 +181,15 @@ exports.methods = {
 		}
 		throw lastErr || new Error(`Panel open failed: ${PANEL_NAME_CANDIDATES.join(', ')}`);
 	},
-	async buildPlayable(outputDir, useBase64) {
+	async buildPlayable(outputDir, useBase64, blobCompression) {
 		const projectPath = Editor.Project.path;
 		const current = loadBuildConfig(projectPath);
 		const next = saveBuildConfig(projectPath, {
 			outputDir: outputDir ? normalizeOutputDir(outputDir) : current.outputDir,
 			useBase64: useBase64 ?? current.useBase64,
+			blobCompression: blobCompression === undefined ? current.blobCompression : normalizeBlobCompression(blobCompression),
 		});
-		const result = await runPlayableBuild(next.outputDir, next.useBase64);
+		const result = await runPlayableBuild(next.outputDir, next.useBase64, next.blobCompression);
 		if (result.stdout) {
 			console.log(`[PlayableAdsSetting] ${result.stdout}`);
 		}
@@ -189,6 +213,14 @@ exports.methods = {
 	async setUseBase64(useBase64) {
 		const projectPath = Editor.Project.path;
 		return saveUseBase64Setting(projectPath, useBase64);
+	},
+	async getBlobCompression() {
+		const projectPath = Editor.Project.path;
+		return loadBlobCompressionSetting(projectPath);
+	},
+	async setBlobCompression(blobCompression) {
+		const projectPath = Editor.Project.path;
+		return saveBlobCompressionSetting(projectPath, blobCompression);
 	},
 	async getBuildConfig() {
 		const projectPath = Editor.Project.path;

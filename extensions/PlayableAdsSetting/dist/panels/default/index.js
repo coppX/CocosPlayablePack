@@ -28,6 +28,11 @@ module.exports = Editor.Panel.define({
         <div class="field-label">Output Directory</div>
         <ui-input id="outDirInput" class="dir-input"></ui-input>
         <ui-checkbox id="useBase64Toggle" class="base64-toggle">Use Base64 For Assets</ui-checkbox>
+        <div class="field-label">Blob Compression</div>
+        <ui-select id="blobCompressionSelect" class="compression-select">
+            <option value="none">None</option>
+            <option value="gzip">Gzip</option>
+        </ui-select>
         <ui-button id="saveSettingBtn" class="save-btn">Save Setting</ui-button>
     </div>
     <div class="button-row">
@@ -70,6 +75,10 @@ module.exports = Editor.Panel.define({
     margin-top: 2px;
 }
 
+.compression-select {
+    width: 100%;
+}
+
 .button-row {
     display: flex;
     gap: 8px;
@@ -110,6 +119,7 @@ module.exports = Editor.Panel.define({
         saveSettingBtn: '#saveSettingBtn',
         outDirInput: '#outDirInput',
         useBase64Toggle: '#useBase64Toggle',
+        blobCompressionSelect: '#blobCompressionSelect',
         status: '#status',
     },
 
@@ -142,6 +152,25 @@ module.exports = Editor.Panel.define({
             } catch {}
         },
 
+        normalizeBlobCompression(value) {
+            const v = String(value ?? '').trim().toLowerCase();
+            return v === 'gzip' ? 'gzip' : 'none';
+        },
+
+        getBlobCompression() {
+            const select = this.$.blobCompressionSelect;
+            if (!select) return 'none';
+            return this.normalizeBlobCompression(select.value);
+        },
+
+        setBlobCompression(blobCompression) {
+            const select = this.$.blobCompressionSelect;
+            if (!select) return;
+            const v = this.normalizeBlobCompression(blobCompression);
+            try { select.value = v; } catch {}
+            try { select.setAttribute?.('value', v); } catch {}
+        },
+
         async loadBuildConfig() {
             const input = this.$.outDirInput;
             if (!input) return;
@@ -149,9 +178,11 @@ module.exports = Editor.Panel.define({
                 const config = await requestMain('get-build-config');
                 input.value = String(config?.outputDir || 'dist-playable');
                 this.setUseBase64(config?.useBase64 ?? true);
+                this.setBlobCompression(config?.blobCompression ?? 'none');
             } catch {
                 input.value = 'dist-playable';
                 this.setUseBase64(true);
+                this.setBlobCompression('none');
             }
         },
 
@@ -167,12 +198,14 @@ module.exports = Editor.Panel.define({
         async onSaveSetting() {
             const outputDir = this.getOutputDir();
             const useBase64 = this.getUseBase64();
+            const blobCompression = this.getBlobCompression();
             try {
-                const saved = await requestMain('set-build-config', { outputDir, useBase64 });
+                const saved = await requestMain('set-build-config', { outputDir, useBase64, blobCompression });
                 const input = this.$.outDirInput;
                 if (input) input.value = saved.outputDir;
                 this.setUseBase64(saved.useBase64);
-                this.setStatus(`Setting saved: ${saved.outputDir} | base64=${saved.useBase64 ? 'on' : 'off'}`, 'success');
+                this.setBlobCompression(saved.blobCompression);
+                this.setStatus(`Setting saved: ${saved.outputDir} | base64=${saved.useBase64 ? 'on' : 'off'} | compression=${saved.blobCompression}`, 'success');
             } catch (err) {
                 this.setStatus(`Save failed: ${String(err)}`, 'error');
             }
@@ -195,15 +228,16 @@ module.exports = Editor.Panel.define({
         async onBuild() {
             const outputDir = this.getOutputDir();
             const useBase64 = this.getUseBase64();
+            const blobCompression = this.getBlobCompression();
             const buildBtn = this.$.buildBtn;
             if (buildBtn) buildBtn.disabled = true;
             this.setStatus('Building...', 'normal');
 
             try {
-                await requestMain('set-build-config', { outputDir, useBase64 });
-                const result = await requestMain('build-playable', outputDir, useBase64);
+                await requestMain('set-build-config', { outputDir, useBase64, blobCompression });
+                const result = await requestMain('build-playable', outputDir, useBase64, blobCompression);
                 if (result && result.ok) {
-                    this.setStatus(`Build complete. Output: ${result.outputDir || outputDir} | base64=${result.useBase64 ? 'on' : 'off'}`, 'success');
+                    this.setStatus(`Build complete. Output: ${result.outputDir || outputDir} | base64=${result.useBase64 ? 'on' : 'off'} | compression=${result.blobCompression || blobCompression}`, 'success');
                 } else {
                     const err = (result && (result.stderr || result.stdout)) || `Exit code: ${(result && result.code) ?? 'unknown'}`;
                     this.setStatus(`Build failed: ${err}`, 'error');

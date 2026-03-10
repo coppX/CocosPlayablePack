@@ -74,6 +74,16 @@
                     "setUseBase64"
                 ]
             },
+            "get-blob-compression": {
+                "methods": [
+                    "getBlobCompression"
+                ]
+            },
+            "set-blob-compression": {
+                "methods": [
+                    "setBlobCompression"
+                ]
+            },
             "get-build-config": {
                 "methods": [
                     "getBuildConfig"
