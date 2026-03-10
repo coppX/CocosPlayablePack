@@ -355,6 +355,20 @@ async function compressImageBuffer(rel, buf, quality, compressor) {
   return next;
 }
 
+function chunkString(source, chunkSize) {
+  const out = [];
+  for (let i = 0; i < source.length; i += chunkSize) {
+    out.push(source.slice(i, i + chunkSize));
+  }
+  return out;
+}
+
+function buildPackChunkTags(chunks) {
+  return chunks
+    .map((chunk, idx) => `<script class="__PACK_BIN_CHUNK__" data-idx="${idx}" type="application/octet-stream">${chunk}</script>`)
+    .join('\n');
+}
+
 
 function makeVfsPatchScript() {
   return String.raw`
@@ -492,6 +506,27 @@ function makeVfsPatchScript() {
     return /javascript|ecmascript/.test(mime) || /\.(m?js)$/i.test(String(rel || ''));
   }
 
+  function resolveHitFromInput(input){
+    const rel = resolveRel(norm(input));
+    if (!rel) return { rel: null, hit: null };
+    return { rel, hit: getHit(rel) };
+  }
+
+  function getScriptText(rel, hit){
+    if (!rel || !hit || !isScriptLike(rel)) return null;
+    return getEntryText(hit);
+  }
+
+  function createObjectURL(parts, mime){
+    const URL_API = window.URL || window.webkitURL;
+    if (!URL_API || typeof URL_API.createObjectURL !== 'function') return null;
+    const blob = new Blob(parts, { type: mime });
+    return {
+      URL_API,
+      objectURL: URL_API.createObjectURL(blob),
+    };
+  }
+
   function patchSystemShouldFetch(){
     try {
       const S = window.System;
@@ -507,18 +542,18 @@ function makeVfsPatchScript() {
         : null;
 
       proto.shouldFetch = function(url){
-        const rel = resolveRel(norm(url));
-        if (rel) {
-          const hit = getHit(rel);
-          if (hit && getEntryText(hit) != null && isScriptLike(rel)) return true;
+        const resolved = resolveHitFromInput(url);
+        if (resolved.rel) {
+          const scriptText = getScriptText(resolved.rel, resolved.hit);
+          if (scriptText != null) return true;
         }
         return originalShouldFetch.call(this, url);
       };
 
       proto.fetch = function(url, init){
-        const rel = resolveRel(norm(url));
-        if (rel) {
-          const response = toResponse(rel, init);
+        const resolved = resolveHitFromInput(url);
+        if (resolved.rel) {
+          const response = toResponse(resolved.rel, init);
           if (response) return Promise.resolve(response);
         }
         if (originalSystemFetch) return originalSystemFetch.call(this, url, init);
@@ -548,14 +583,13 @@ function makeVfsPatchScript() {
           return origGet ? origGet.call(this) : '';
         },
         set: function(v){
-          const rel = resolveRel(norm(v));
-          const hit = rel && getHit(rel);
-          const scriptText = hit && isScriptLike(rel) ? getEntryText(hit) : null;
+          const resolved = resolveHitFromInput(v);
+          const rel = resolved.rel;
+          const scriptText = getScriptText(rel, resolved.hit);
           if (scriptText != null) {
-            const URL_API = window.URL || window.webkitURL;
-            if (URL_API && typeof URL_API.createObjectURL === 'function') {
-              const blob = new Blob([scriptText], { type: getEntryMime(rel) || 'text/javascript' });
-              const objectURL = URL_API.createObjectURL(blob);
+            const created = createObjectURL([scriptText], getEntryMime(rel) || 'text/javascript');
+            if (created) {
+              const { URL_API, objectURL } = created;
               if (typeof this.addEventListener === 'function') {
                 const self = this;
                 const cleanup = function(){
@@ -602,9 +636,8 @@ function makeVfsPatchScript() {
           try { src = node.src || ''; } catch (e) {}
         }
 
-        const rel = resolveRel(norm(src));
-        const hit = rel && getHit(rel);
-        const scriptText = hit && isScriptLike(rel) ? getEntryText(hit) : null;
+        const resolved = resolveHitFromInput(src);
+        const scriptText = getScriptText(resolved.rel, resolved.hit);
         if (scriptText == null) return;
 
         try { if (typeof node.removeAttribute === 'function') node.removeAttribute('src'); } catch (e) {}
@@ -651,9 +684,9 @@ function makeVfsPatchScript() {
 
   if (ORIGIN_FETCH) {
     window.fetch = function(input, init){
-      const rel = resolveRel(norm(input));
-      if (rel) {
-        const response = toResponse(rel, init);
+      const resolved = resolveHitFromInput(input);
+      if (resolved.rel) {
+        const response = toResponse(resolved.rel, init);
         if (response) return Promise.resolve(response);
       }
       return ORIGIN_FETCH(input, init);
@@ -686,22 +719,19 @@ function makeVfsPatchScript() {
     };
 
     XHR.prototype.send = function(body){
-      const rel = resolveRel(norm(this.__vfs_url__));
-      const hit = rel && getHit(rel);
+      const resolved = resolveHitFromInput(this.__vfs_url__);
+      const rel = resolved.rel;
+      const hit = resolved.hit;
       if (!hit) return send.apply(this, arguments);
-
-      const URL_API = window.URL || window.webkitURL;
-      if (!URL_API || typeof URL_API.createObjectURL !== 'function') {
-        return send.apply(this, arguments);
-      }
 
       try {
         const mime = getEntryMime(rel);
         const bytes = getEntryBytes(hit);
         if (!bytes) return send.apply(this, arguments);
         const payload = bytes;
-        const blob = new Blob([payload], { type: mime });
-        const objectURL = URL_API.createObjectURL(blob);
+        const created = createObjectURL([payload], mime);
+        if (!created) return send.apply(this, arguments);
+        const { URL_API, objectURL } = created;
         const self = this;
 
         const cleanup = function(){
@@ -751,15 +781,15 @@ function makeVfsPatchScript() {
       if (desc && desc.set) {
         Object.defineProperty(img, 'src', {
           set(v){
-            const rel = resolveRel(norm(v));
-            const hit = rel && getHit(rel);
+            const resolved = resolveHitFromInput(v);
+            const rel = resolved.rel;
+            const hit = resolved.hit;
             if (hit) {
               const bytes = getEntryBytes(hit);
               if (bytes) {
-                const b = new Blob([bytes], { type: getEntryMime(rel) });
-                const URL_API = window.URL || window.webkitURL;
-                if (URL_API && typeof URL_API.createObjectURL === 'function') {
-                  const objectURL = URL_API.createObjectURL(b);
+                const created = createObjectURL([bytes], getEntryMime(rel));
+                if (created) {
+                  const objectURL = created.objectURL;
                   return desc.set.call(img, objectURL);
                 }
               }
@@ -779,22 +809,43 @@ function sha1(s) {
   return crypto.createHash('sha1').update(s).digest('hex').slice(0, 10);
 }
 
-function inlineHtml(channel, manifest, blob, useBase64) {
-  let html = fs.readFileSync(path.join(BUILD_DIR, 'index.html'), 'utf8');
-  const manifestJson = JSON.stringify(manifest);
-  const blobPayload = useBase64 ? blob.toString('base64') : encodeBase91(blob);
-  const PACK_CHUNK_SIZE = 256 * 1024;
+function inlineScriptTag(source) {
+  return `<script>\n${escapeInlineScript(source)}\n</script>`;
+}
 
-  const blobChunks = [];
-  for (let i = 0; i < blobPayload.length; i += PACK_CHUNK_SIZE) {
-    blobChunks.push(blobPayload.slice(i, i + PACK_CHUNK_SIZE));
-  }
-  const packedChunkTags = blobChunks
-    .map((chunk, idx) => `<script class="__PACK_BIN_CHUNK__" data-idx="${idx}" type="application/octet-stream">${chunk}</script>`)
-    .join('\n');
-  const manifestTag = `<script id="__PACK_MANIFEST__" type="application/octet-stream">${escapeInlineScript(manifestJson)}</script>`;
+function inlineImportMapTag(source) {
+  return `<script type="systemjs-importmap">\n${String(source).replace(/<\/script/gi, '<\\/script')}\n</script>`;
+}
 
-  const packedBootstrap = `<script>(function(){
+function addFaviconIfMissing(html) {
+  if (/<link[^>]+rel=["']icon["']/i.test(html)) return html;
+  return html.replace(/<head>/i, '<head>\n  <link rel="icon" href="data:,">');
+}
+
+function inlineStyleIfPresent(html) {
+  if (!fs.existsSync(path.join(BUILD_DIR, 'style.css'))) return html;
+  const css = readText('style.css');
+  return html.replace(/<link[^>]+href="style\.css"[^>]*>/i, `<style>\n${escapeInlineStyle(css)}\n</style>`);
+}
+
+function inlineScriptSrcAsset(html, relPath) {
+  const escaped = relPath
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\//g, '\\/');
+  const re = new RegExp(`<script[^>]*src="${escaped}"[^>]*>\\s*<\\/script>`, 'i');
+  return html.replace(re, inlineScriptTag(readText(relPath)));
+}
+
+function inlineImportMapAsset(html, relPath) {
+  const escaped = relPath
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\//g, '\\/');
+  const re = new RegExp(`<script[^>]*src="${escaped}"[^>]*type="systemjs-importmap"[^>]*>\\s*<\\/script>`, 'i');
+  return html.replace(re, inlineImportMapTag(readText(relPath)));
+}
+
+function makePackBootstrapScript(useBase64) {
+  return `<script>(function(){
   const PACK_ENCODING = ${JSON.stringify(useBase64 ? 'base64' : 'base91')};
   const B91_ALPHABET = ${JSON.stringify(B91_ALPHABET)};
   const nodes = document.querySelectorAll('script.__PACK_BIN_CHUNK__');
@@ -911,30 +962,24 @@ function inlineHtml(channel, manifest, blob, useBase64) {
     window.__PACK_BLOB__ = new Uint8Array(0);
   }
 })();</script>`;
+}
 
-  if (!/<link[^>]+rel=["']icon["']/i.test(html)) {
-    html = html.replace(/<head>/i, '<head>\n  <link rel="icon" href="data:,">');
-  }
+function inlineHtml(channel, manifest, blob, useBase64) {
+  let html = fs.readFileSync(path.join(BUILD_DIR, 'index.html'), 'utf8');
+  const manifestJson = JSON.stringify(manifest);
+  const blobPayload = useBase64 ? blob.toString('base64') : encodeBase91(blob);
+  const PACK_CHUNK_SIZE = 256 * 1024;
 
-  if (fs.existsSync(path.join(BUILD_DIR, 'style.css'))) {
-    const css = readText('style.css');
-    html = html.replace(/<link[^>]+href="style\.css"[^>]*>/i, `<style>\n${escapeInlineStyle(css)}\n</style>`);
-  }
+  const blobChunks = chunkString(blobPayload, PACK_CHUNK_SIZE);
+  const packedChunkTags = buildPackChunkTags(blobChunks);
+  const manifestTag = `<script id="__PACK_MANIFEST__" type="application/octet-stream">${escapeInlineScript(manifestJson)}</script>`;
+  const packedBootstrap = makePackBootstrapScript(useBase64);
 
-  html = html.replace(
-    /<script[^>]*src="src\/polyfills\.bundle\.js"[^>]*>\s*<\/script>/i,
-    `<script>\n${escapeInlineScript(readText('src/polyfills.bundle.js'))}\n</script>`
-  );
-
-  html = html.replace(
-    /<script[^>]*src="src\/system\.bundle\.js"[^>]*>\s*<\/script>/i,
-    `<script>\n${escapeInlineScript(readText('src/system.bundle.js'))}\n</script>`
-  );
-
-  html = html.replace(
-    /<script[^>]*src="src\/import-map\.json"[^>]*type="systemjs-importmap"[^>]*>\s*<\/script>/i,
-    `<script type="systemjs-importmap">\n${readText('src/import-map.json').replace(/<\/script/gi, '<\\/script')}\n</script>`
-  );
+  html = addFaviconIfMissing(html);
+  html = inlineStyleIfPresent(html);
+  html = inlineScriptSrcAsset(html, 'src/polyfills.bundle.js');
+  html = inlineScriptSrcAsset(html, 'src/system.bundle.js');
+  html = inlineImportMapAsset(html, 'src/import-map.json');
 
   const injected =
 `<script>window.__CHANNEL__=${JSON.stringify(channel)};</script>
