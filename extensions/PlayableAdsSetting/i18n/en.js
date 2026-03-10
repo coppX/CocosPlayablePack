@@ -1,0 +1,1 @@
+"use strict";module.exports={description:"Playable ads helper tools",show_log:"Output log",open_panel:"Open Playable Builder",panel_title:"Playable Ads Setting"};

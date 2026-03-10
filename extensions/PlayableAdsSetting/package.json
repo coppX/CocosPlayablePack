@@ -1,0 +1,89 @@
+{
+    "$schema": "./@types/schema/package/index.json",
+    "package_version": 2,
+    "name": "playableadssetting",
+    "version": "1.0.0",
+    "author": "Cocos Creator",
+    "editor": ">=3.8.8",
+    "scripts": {
+        "preinstall": "node ./scripts/preinstall.js",
+        "build": "tsc",
+        "watch": "tsc -w"
+    },
+    "description": "Playable ads helper tools",
+    "main": "./dist/main.js",
+    "devDependencies": {
+        "@cocos/creator-types": "^3.8.8",
+        "@types/node": "^18.17.1",
+        "typescript": "^5.8.2"
+    },
+    "panels": {
+        "default": {
+            "title": "Playable Ads Setting",
+            "main": "./dist/panels/default/index.js",
+            "type": "dockable",
+            "size": {
+                "min-width": 320,
+                "min-height": 180,
+                "width": 420,
+                "height": 220
+            }
+        }
+    },
+    "contributions": {
+        "menu": [
+            {
+                "path": "PlayableAdsSetting",
+                "label": "Open Playable Builder",
+                "message": "open-panel"
+            }
+        ],
+        "messages": {
+            "open-panel": {
+                "methods": [
+                    "openPanel"
+                ]
+            },
+            "build-playable": {
+                "methods": [
+                    "buildPlayable"
+                ]
+            },
+            "open-output-dir": {
+                "methods": [
+                    "openOutputDir"
+                ]
+            },
+            "get-output-dir": {
+                "methods": [
+                    "getOutputDir"
+                ]
+            },
+            "set-output-dir": {
+                "methods": [
+                    "setOutputDir"
+                ]
+            },
+            "get-use-base64": {
+                "methods": [
+                    "getUseBase64"
+                ]
+            },
+            "set-use-base64": {
+                "methods": [
+                    "setUseBase64"
+                ]
+            },
+            "get-build-config": {
+                "methods": [
+                    "getBuildConfig"
+                ]
+            },
+            "set-build-config": {
+                "methods": [
+                    "setBuildConfig"
+                ]
+            }
+        }
+    }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "NewProject_2",
+  "uuid": "96c6ca81-0b87-4e97-b7c3-7b872cd1a0f1",
+  "version": "3.0.0",
+  "_sourceId": "c30b28da-749e-479b-bcb6-cecd8d7be9e3",
+  "creator": {
+    "version": "3.8.8"
+  },
+  "devDependencies": {
+    "jimp": "^1.6.0"
+  }
+}

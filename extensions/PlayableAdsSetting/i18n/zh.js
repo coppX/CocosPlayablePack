@@ -1,0 +1,1 @@
+"use strict";module.exports={description:"Playable 广告辅助工具",show_log:"输出日志",open_panel:"打开 Playable 构建面板",panel_title:"Playable 广告设置"};
